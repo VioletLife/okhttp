@@ -16,6 +16,8 @@
 package com.squareup.okhttp.mockwebserver;
 
 import com.squareup.okhttp.Headers;
+import com.squareup.okhttp.internal.Internal;
+import com.squareup.okhttp.internal.framed.Settings;
 import com.squareup.okhttp.ws.WebSocketListener;
 import java.util.ArrayList;
 import java.util.List;
@@ -41,6 +43,7 @@ public final class MockResponse implements Cloneable {
   private TimeUnit bodyDelayUnit = TimeUnit.MILLISECONDS;
 
   private List<PushPromise> promises = new ArrayList<>();
+  private Settings settings;
   private WebSocketListener webSocketListener;
 
   /** Creates a new mock response with an empty body. */
@@ -102,6 +105,16 @@ public final class MockResponse implements Cloneable {
    */
   public MockResponse addHeader(String name, Object value) {
     headers.add(name, String.valueOf(value));
+    return this;
+  }
+
+  /**
+   * Adds a new header with the name and value. This may be used to add multiple
+   * headers with the same name. Unlike {@link #addHeader(String, Object)} this
+   * does not validate the name and value.
+   */
+  public MockResponse addHeaderLenient(String name, Object value) {
+    Internal.instance.addLenient(headers, name, String.valueOf(value));
     return this;
   }
 
@@ -228,6 +241,20 @@ public final class MockResponse implements Cloneable {
   /** Returns the streams the server will push with this response. */
   public List<PushPromise> getPushPromises() {
     return promises;
+  }
+
+  /**
+   * When {@linkplain MockWebServer#setProtocols(java.util.List) protocols}
+   * include {@linkplain com.squareup.okhttp.Protocol#HTTP_2 HTTP/2}, this
+   * pushes {@code settings} before writing the response.
+   */
+  public MockResponse withSettings(Settings settings) {
+    this.settings = settings;
+    return this;
+  }
+
+  public Settings getSettings() {
+    return settings;
   }
 
   /**

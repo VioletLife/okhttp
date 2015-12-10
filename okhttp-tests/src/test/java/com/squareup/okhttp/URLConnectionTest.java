@@ -19,7 +19,7 @@ package com.squareup.okhttp;
 import com.squareup.okhttp.internal.Internal;
 import com.squareup.okhttp.internal.RecordingAuthenticator;
 import com.squareup.okhttp.internal.RecordingOkAuthenticator;
-import com.squareup.okhttp.internal.SingleInetAddressNetwork;
+import com.squareup.okhttp.internal.SingleInetAddressDns;
 import com.squareup.okhttp.internal.SslContextBuilder;
 import com.squareup.okhttp.internal.Util;
 import com.squareup.okhttp.internal.Version;
@@ -607,7 +607,7 @@ public final class URLConnectionTest {
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
 
     suppressTlsFallbackScsv(client.client());
-    Internal.instance.setNetwork(client.client(), new SingleInetAddressNetwork());
+    client.client().setDns(new SingleInetAddressDns());
 
     client.client().setHostnameVerifier(new RecordingHostnameVerifier());
     connection = client.open(server.getUrl("/foo"));
@@ -873,7 +873,7 @@ public final class URLConnectionTest {
 
     // Configure a single IP address for the host and a single configuration, so we only need one
     // failure to fail permanently.
-    Internal.instance.setNetwork(client.client(), new SingleInetAddressNetwork());
+    client.client().setDns(new SingleInetAddressDns());
     client.client().setSslSocketFactory(sslContext.getSocketFactory());
     client.client().setConnectionSpecs(Util.immutableList(ConnectionSpec.MODERN_TLS));
     client.client().setHostnameVerifier(new RecordingHostnameVerifier());
@@ -916,8 +916,8 @@ public final class URLConnectionTest {
 
     RecordedRequest connect = server.takeRequest();
     assertNull(connect.getHeader("Private"));
-    assertEquals("bar", connect.getHeader("Proxy-Authorization"));
-    assertEquals("baz", connect.getHeader("User-Agent"));
+    assertNull(connect.getHeader("Proxy-Authorization"));
+    assertEquals(Version.userAgent(), connect.getHeader("User-Agent"));
     assertEquals("android.com", connect.getHeader("Host"));
     assertEquals("Keep-Alive", connect.getHeader("Proxy-Connection"));
 
@@ -1276,7 +1276,7 @@ public final class URLConnectionTest {
 
     HttpURLConnection connection = client.open(server.getUrl("/"));
     assertContent("{}", connection);
-    assertEquals(0, client.client().getConnectionPool().getConnectionCount());
+    assertEquals(0, client.client().getConnectionPool().getIdleConnectionCount());
   }
 
   @Test public void earlyDisconnectDoesntHarmPoolingWithChunkedEncoding() throws Exception {
@@ -1958,7 +1958,7 @@ public final class URLConnectionTest {
 
     assertContent("This is the 2nd server!", client.open(server.getUrl("/a")));
 
-    assertEquals(Arrays.asList(server.getUrl("/a").toURI(), server2.getUrl("/b").toURI()),
+    assertEquals(Arrays.asList(server.getUrl("/").toURI(), server2.getUrl("/").toURI()),
         proxySelectionRequests);
   }
 
@@ -2226,24 +2226,29 @@ public final class URLConnectionTest {
 
   /** Confirm that an unacknowledged write times out. */
   @Test public void writeTimeouts() throws IOException {
+    MockWebServer server = new MockWebServer();
     // Sockets on some platforms can have large buffers that mean writes do not block when
     // required. These socket factories explicitly set the buffer sizes on sockets created.
-    final int SOCKET_BUFFER_SIZE = 256 * 1024;
+    final int SOCKET_BUFFER_SIZE = 4 * 1024;
     server.setServerSocketFactory(
         new DelegatingServerSocketFactory(ServerSocketFactory.getDefault()) {
           @Override
-          protected void configureServerSocket(ServerSocket serverSocket) throws IOException {
+          protected ServerSocket configureServerSocket(ServerSocket serverSocket)
+              throws IOException {
             serverSocket.setReceiveBufferSize(SOCKET_BUFFER_SIZE);
+            return serverSocket;
           }
         });
     client.client().setSocketFactory(new DelegatingSocketFactory(SocketFactory.getDefault()) {
       @Override
-      protected void configureSocket(Socket socket) throws IOException {
+      protected Socket configureSocket(Socket socket) throws IOException {
         socket.setReceiveBufferSize(SOCKET_BUFFER_SIZE);
         socket.setSendBufferSize(SOCKET_BUFFER_SIZE);
+        return socket;
       }
     });
 
+    server.start();
     server.enqueue(new MockResponse()
         .throttleBody(1, 1, TimeUnit.SECONDS)); // Prevent the server from reading!
 
@@ -2253,7 +2258,7 @@ public final class URLConnectionTest {
     connection.setChunkedStreamingMode(0);
     OutputStream out = connection.getOutputStream();
     try {
-      byte[] data = new byte[16 * 1024 * 1024]; // 16 MiB.
+      byte[] data = new byte[2 * 1024 * 1024]; // 2 MiB.
       out.write(data);
       fail();
     } catch (SocketTimeoutException expected) {
@@ -2424,7 +2429,7 @@ public final class URLConnectionTest {
   }
 
   @Test public void malformedUrlThrowsUnknownHostException() throws IOException {
-    connection = client.open(new URL("http:///foo.html"));
+    connection = client.open(new URL("http://./foo.html"));
     try {
       connection.connect();
       fail();
@@ -3176,6 +3181,70 @@ public final class URLConnectionTest {
 
     server.enqueue(new MockResponse().setBody("abc"));
     assertContent("abc", client.open(server.getUrl("/")));
+  }
+
+  @Test public void urlWithSpaceInHost() throws Exception {
+    URLConnection urlConnection = client.open(new URL("http://and roid.com/"));
+    try {
+      urlConnection.getInputStream();
+      fail();
+    } catch (UnknownHostException expected) {
+    }
+  }
+
+  @Test public void urlWithSpaceInHostViaHttpProxy() throws Exception {
+    server.enqueue(new MockResponse());
+    URLConnection urlConnection =
+        client.open(new URL("http://and roid.com/"), server.toProxyAddress());
+
+    try {
+      // This test is to check that a NullPointerException is not thrown.
+      urlConnection.getInputStream();
+      fail(); // the RI makes a bogus proxy request for "GET http://and roid.com/ HTTP/1.1"
+    } catch (UnknownHostException expected) {
+    }
+  }
+
+  @Test public void urlHostWithNul() throws Exception {
+    URLConnection urlConnection = client.open(new URL("http://host\u0000/"));
+    try {
+      urlConnection.getInputStream();
+      fail();
+    } catch (UnknownHostException expected) {
+    }
+  }
+
+  @Test public void urlRedirectToHostWithNul() throws Exception {
+    String redirectUrl = "http://host\u0000/";
+    server.enqueue(new MockResponse().setResponseCode(302)
+        .addHeaderLenient("Location", redirectUrl));
+
+    HttpURLConnection urlConnection = client.open(server.getUrl("/"));
+    assertEquals(302, urlConnection.getResponseCode());
+    assertEquals(redirectUrl, urlConnection.getHeaderField("Location"));
+  }
+
+  @Test public void urlWithBadAsciiHost() throws Exception {
+    URLConnection urlConnection = client.open(new URL("http://host\u0001/"));
+    try {
+      urlConnection.getInputStream();
+      fail();
+    } catch (UnknownHostException expected) {
+    }
+  }
+
+  @Test public void instanceFollowsRedirects() throws Exception {
+    testInstanceFollowsRedirects("http://www.google.com/");
+    testInstanceFollowsRedirects("https://www.google.com/");
+  }
+
+  private void testInstanceFollowsRedirects(String spec) throws Exception {
+    URL url = new URL(spec);
+    HttpURLConnection urlConnection = client.open(url);
+    urlConnection.setInstanceFollowRedirects(true);
+    assertTrue(urlConnection.getInstanceFollowRedirects());
+    urlConnection.setInstanceFollowRedirects(false);
+    assertFalse(urlConnection.getInstanceFollowRedirects());
   }
 
   /** Returns a gzipped copy of {@code bytes}. */

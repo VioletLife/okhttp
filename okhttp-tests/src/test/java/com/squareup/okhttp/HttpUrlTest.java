@@ -17,8 +17,10 @@ package com.squareup.okhttp;
 
 import com.squareup.okhttp.UrlComponentEncodingTester.Component;
 import com.squareup.okhttp.UrlComponentEncodingTester.Encoding;
+import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URL;
+import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
@@ -27,6 +29,7 @@ import org.junit.Test;
 
 import static java.util.Collections.singletonList;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.fail;
 
 public final class HttpUrlTest {
@@ -38,6 +41,11 @@ public final class HttpUrlTest {
     assertEquals(expected, HttpUrl.parse("    http://host/    ")); // Both.
     assertEquals(expected, HttpUrl.parse("http://host/").resolve("   "));
     assertEquals(expected, HttpUrl.parse("http://host/").resolve("  .  "));
+  }
+
+  @Test public void parseHostAsciiNonPrintable() throws Exception {
+    String host = "host\u0001";
+    assertNull(HttpUrl.parse("http://" + host + "/"));
   }
 
   @Test public void parseDoesNotTrimOtherWhitespaceCharacters() throws Exception {
@@ -81,6 +89,8 @@ public final class HttpUrlTest {
     assertEquals(HttpUrl.parse("http://host/"), HttpUrl.parse("HTTP://host/"));
     assertEquals(HttpUrl.parse("https://host/"), HttpUrl.parse("https://host/"));
     assertEquals(HttpUrl.parse("https://host/"), HttpUrl.parse("HTTPS://host/"));
+    assertEquals(HttpUrl.Builder.ParseResult.UNSUPPORTED_SCHEME,
+        new HttpUrl.Builder().parse(null, "image640://480.png"));
     assertEquals(null, HttpUrl.parse("httpp://host/"));
     assertEquals(null, HttpUrl.parse("0ttp://host/"));
     assertEquals(null, HttpUrl.parse("ht+tp://host/"));
@@ -186,11 +196,20 @@ public final class HttpUrlTest {
     assertEquals(HttpUrl.parse("http://user@host/path"), HttpUrl.parse("http://user@host/path"));
   }
 
+  /** Given multiple '@' characters, the last one is the delimiter. */
   @Test public void authorityWithMultipleAtSigns() throws Exception {
-    assertEquals(HttpUrl.parse("http://foo%40bar@baz/path"),
-        HttpUrl.parse("http://foo@bar@baz/path"));
-    assertEquals(HttpUrl.parse("http://foo:pass1%40bar%3Apass2@baz/path"),
-        HttpUrl.parse("http://foo:pass1@bar:pass2@baz/path"));
+    HttpUrl httpUrl = HttpUrl.parse("http://foo@bar@baz/path");
+    assertEquals("foo@bar", httpUrl.username());
+    assertEquals("", httpUrl.password());
+    assertEquals(HttpUrl.parse("http://foo%40bar@baz/path"), httpUrl);
+  }
+
+  /** Given multiple ':' characters, the first one is the delimiter. */
+  @Test public void authorityWithMultipleColons() throws Exception {
+    HttpUrl httpUrl = HttpUrl.parse("http://foo:pass1@bar:pass2@baz/path");
+    assertEquals("foo", httpUrl.username());
+    assertEquals("pass1@bar:pass2", httpUrl.password());
+    assertEquals(HttpUrl.parse("http://foo:pass1%40bar%3Apass2@baz/path"), httpUrl);
   }
 
   @Test public void usernameAndPassword() throws Exception {
@@ -447,8 +466,45 @@ public final class HttpUrlTest {
     new UrlComponentEncodingTester()
         .override(Encoding.IDENTITY, ' ', '"', '#', '<', '>', '?', '`')
         .skipForUri('%', ' ', '"', '#', '<', '>', '\\', '^', '`', '{', '|', '}')
+        .identityForNonAscii()
         .test(Component.FRAGMENT);
-    // TODO(jwilson): don't percent-encode non-ASCII characters. (But do encode control characters!)
+  }
+
+  @Test public void fragmentNonAscii() throws Exception {
+    HttpUrl url = HttpUrl.parse("http://host/#Σ");
+    assertEquals("http://host/#Σ", url.toString());
+    assertEquals("Σ", url.fragment());
+    assertEquals("Σ", url.encodedFragment());
+    assertEquals("http://host/#Σ", url.uri().toString());
+  }
+
+  @Test public void fragmentNonAsciiThatOffendsJavaNetUri() throws Exception {
+    HttpUrl url = HttpUrl.parse("http://host/#\u0080");
+    assertEquals("http://host/#\u0080", url.toString());
+    assertEquals("\u0080", url.fragment());
+    assertEquals("\u0080", url.encodedFragment());
+    try {
+      url.uri();
+      fail();
+    } catch (IllegalStateException expected) {
+      // Possibly a bug in java.net.URI. Many non-ASCII code points work, this one doesn't!
+    }
+  }
+
+  @Test public void fragmentPercentEncodedNonAscii() throws Exception {
+    HttpUrl url = HttpUrl.parse("http://host/#%C2%80");
+    assertEquals("http://host/#%C2%80", url.toString());
+    assertEquals("\u0080", url.fragment());
+    assertEquals("%C2%80", url.encodedFragment());
+    assertEquals("http://host/#%C2%80", url.uri().toString());
+  }
+
+  @Test public void fragmentPercentEncodedPartialCodePoint() throws Exception {
+    HttpUrl url = HttpUrl.parse("http://host/#%80");
+    assertEquals("http://host/#%80", url.toString());
+    assertEquals("\ufffd", url.fragment()); // Unicode replacement character.
+    assertEquals("%80", url.encodedFragment());
+    assertEquals("http://host/#%80", url.uri().toString());
   }
 
   @Test public void relativePath() throws Exception {
@@ -544,6 +600,8 @@ public final class HttpUrlTest {
         HttpUrl.parse("http://host/%/b").pathSegments());
     assertEquals(Arrays.asList("%"),
         HttpUrl.parse("http://host/%").pathSegments());
+    assertEquals(Arrays.asList("%00"),
+        HttpUrl.parse("http://github.com/%%30%30").pathSegments());
   }
 
   @Test public void malformedUtf8Encoding() {
@@ -912,13 +970,106 @@ public final class HttpUrlTest {
     assertEquals("http://username:password@host/path?query#fragment", uri.toString());
   }
 
-  @Test public void toUriForbiddenCharacter() throws Exception {
-    HttpUrl httpUrl = HttpUrl.parse("http://host/a[b");
+  @Test public void toUriSpecialQueryCharacters() throws Exception {
+    HttpUrl httpUrl = HttpUrl.parse("http://host/?d=abc!@[]^`{}|\\");
+    URI uri = httpUrl.uri();
+    assertEquals("http://host/?d=abc!@[]%5E%60%7B%7D%7C%5C", uri.toString());
+  }
+
+  @Test public void toUriWithUsernameNoPassword() throws Exception {
+    HttpUrl httpUrl = new HttpUrl.Builder()
+        .scheme("http")
+        .username("user")
+        .host("host")
+        .build();
+    assertEquals("http://user@host/", httpUrl.toString());
+    assertEquals("http://user@host/", httpUrl.uri().toString());
+  }
+
+  @Test public void toUriUsernameSpecialCharacters() throws Exception {
+    HttpUrl url = new HttpUrl.Builder()
+        .scheme("http")
+        .host("host")
+        .username("=[]:;\"~|?#@^/$%*")
+        .build();
+    assertEquals("http://%3D%5B%5D%3A%3B%22~%7C%3F%23%40%5E%2F$%25*@host/", url.toString());
+    assertEquals("http://%3D%5B%5D%3A%3B%22~%7C%3F%23%40%5E%2F$%25*@host/", url.uri().toString());
+  }
+
+  @Test public void toUriPasswordSpecialCharacters() throws Exception {
+    HttpUrl url = new HttpUrl.Builder()
+        .scheme("http")
+        .host("host")
+        .username("user")
+        .password("=[]:;\"~|?#@^/$%*")
+        .build();
+    assertEquals("http://user:%3D%5B%5D%3A%3B%22~%7C%3F%23%40%5E%2F$%25*@host/", url.toString());
+    assertEquals("http://user:%3D%5B%5D%3A%3B%22~%7C%3F%23%40%5E%2F$%25*@host/",
+        url.uri().toString());
+  }
+
+  @Test public void toUriPathSpecialCharacters() throws Exception {
+    HttpUrl url = new HttpUrl.Builder()
+        .scheme("http")
+        .host("host")
+        .addPathSegment("=[]:;\"~|?#@^/$%*")
+        .build();
+    assertEquals("http://host/=[]:;%22~%7C%3F%23@%5E%2F$%25*", url.toString());
+    assertEquals("http://host/=%5B%5D:;%22~%7C%3F%23@%5E%2F$%25*", url.uri().toString());
+  }
+  
+  @Test public void toUriQueryParameterNameSpecialCharacters() throws Exception {
+    HttpUrl url = new HttpUrl.Builder()
+        .scheme("http")
+        .host("host")
+        .addQueryParameter("=[]:;\"~|?#@^/$%*", "a")
+        .build();
+    assertEquals("http://host/?%3D[]:;%22~|?%23@^/$%25*=a", url.toString());
+    assertEquals("http://host/?%3D[]:;%22~%7C?%23@%5E/$%25*=a", url.uri().toString());
+  }
+
+  @Test public void toUriQueryParameterValueSpecialCharacters() throws Exception {
+    HttpUrl url = new HttpUrl.Builder()
+        .scheme("http")
+        .host("host")
+        .addQueryParameter("a", "=[]:;\"~|?#@^/$%*")
+        .build();
+    assertEquals("http://host/?a=%3D[]:;%22~|?%23@^/$%25*", url.toString());
+    assertEquals("http://host/?a=%3D[]:;%22~%7C?%23@%5E/$%25*", url.uri().toString());
+  }
+
+  @Test public void toUriQueryValueSpecialCharacters() throws Exception {
+    HttpUrl url = new HttpUrl.Builder()
+        .scheme("http")
+        .host("host")
+        .query("=[]:;\"~|?#@^/$%*")
+        .build();
+    assertEquals("http://host/?=[]:;%22~|?%23@^/$%25*", url.toString());
+    assertEquals("http://host/?=[]:;%22~%7C?%23@%5E/$%25*", url.uri().toString());
+  }
+
+  @Test public void toUriFragmentSpecialCharacters() throws Exception {
+    HttpUrl url = new HttpUrl.Builder()
+        .scheme("http")
+        .host("host")
+        .fragment("=[]:;\"~|?#@^/$%*")
+        .build();
+    assertEquals("http://host/#=[]:;\"~|?#@^/$%25*", url.toString());
+    assertEquals("http://host/#=[]:;%22~%7C?%23@%5E/$%25*", url.uri().toString());
+  }
+
+  @Test public void toUriWithMalformedPercentEscape() throws Exception {
+    HttpUrl url = new HttpUrl.Builder()
+        .scheme("http")
+        .host("host")
+        .encodedPath("/%xx")
+        .build();
+    assertEquals("http://host/%xx", url.toString());
     try {
-      httpUrl.uri();
+      url.uri();
       fail();
     } catch (IllegalStateException expected) {
-      assertEquals("not valid as a java.net.URI: http://host/a[b", expected.getMessage());
+      assertEquals("not valid as a java.net.URI: http://host/%xx", expected.getMessage());
     }
   }
 
@@ -949,6 +1100,27 @@ public final class HttpUrlTest {
     assertEquals(null, HttpUrl.get(uri));
   }
 
+  @Test public void fromJavaNetUrl_checked() throws Exception {
+    HttpUrl httpUrl = HttpUrl.getChecked("http://username:password@host/path?query#fragment");
+    assertEquals("http://username:password@host/path?query#fragment", httpUrl.toString());
+  }
+
+  @Test public void fromJavaNetUrlUnsupportedScheme_checked() throws Exception {
+    try {
+      HttpUrl.getChecked("mailto:user@example.com");
+      fail();
+    } catch (MalformedURLException e) {
+    }
+  }
+
+  @Test public void fromJavaNetUrlBadHost_checked() throws Exception {
+    try {
+      HttpUrl.getChecked("http://hostw ithspace/");
+      fail();
+    } catch (UnknownHostException expected) {
+    }
+  }
+
   @Test public void composeQueryWithComponents() throws Exception {
     HttpUrl base = HttpUrl.parse("http://host/");
     HttpUrl url = base.newBuilder().addQueryParameter("a+=& b", "c+=& d").build();
@@ -966,7 +1138,7 @@ public final class HttpUrlTest {
   @Test public void composeQueryWithEncodedComponents() throws Exception {
     HttpUrl base = HttpUrl.parse("http://host/");
     HttpUrl url = base.newBuilder().addEncodedQueryParameter("a+=& b", "c+=& d").build();
-    assertEquals("http://host/?a%20%3D%26%20b=c%20%3D%26%20d", url.toString());
+    assertEquals("http://host/?a+%3D%26%20b=c+%3D%26%20d", url.toString());
     assertEquals("c =& d", url.queryParameter("a =& b"));
   }
 
@@ -1002,7 +1174,7 @@ public final class HttpUrlTest {
         .addEncodedQueryParameter("a+=& b", "c+=& d")
         .setEncodedQueryParameter("a+=& b", "ef")
         .build();
-    assertEquals("http://host/?a%20%3D%26%20b=ef", url.toString());
+    assertEquals("http://host/?a+%3D%26%20b=ef", url.toString());
     assertEquals("ef", url.queryParameter("a =& b"));
   }
 
@@ -1128,5 +1300,25 @@ public final class HttpUrlTest {
     assertEquals(urlString, url.toString());
     assertEquals(urlString, url.newBuilder().build().toString());
     assertEquals("http://%6d%6D:%6d%6D@host/%6d%6D?%6d%6D", url.resolve("").toString());
+  }
+
+  @Test public void clearFragment() throws Exception {
+    HttpUrl url = HttpUrl.parse("http://host/#fragment")
+        .newBuilder()
+        .fragment(null)
+        .build();
+    assertEquals("http://host/", url.toString());
+    assertEquals(null, url.fragment());
+    assertEquals(null, url.encodedFragment());
+  }
+
+  @Test public void clearEncodedFragment() throws Exception {
+    HttpUrl url = HttpUrl.parse("http://host/#fragment")
+        .newBuilder()
+        .encodedFragment(null)
+        .build();
+    assertEquals("http://host/", url.toString());
+    assertEquals(null, url.fragment());
+    assertEquals(null, url.encodedFragment());
   }
 }
